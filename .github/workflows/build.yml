@@ -1,154 +1,228 @@
 name: Build and Create DMG
 
 on:
-  workflow_dispatch: {}         # allow manual runs from Actions UI
-  push:
-    branches:
-      - main
-      - dev
-  pull_request:
-    branches:
-      - main
-      - dev
+workflow_dispatch: {}
+push:
+branches:
+- main
+- dev
+pull_request:
+branches:
+- main
+- dev
+
+permissions:
+contents: read
 
 jobs:
-  build:
-    runs-on: macos-latest
-    outputs:
-      version: ${{ steps.get_version.outputs.version }}
+build:
+runs-on: macos-latest
+permissions:
+contents: read
+outputs:
+version: ${{ steps.get_version.outputs.version }}
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+  - name: Set up Bun
+    uses: oven-sh/setup-bun@v2
+    with:
+      bun-version: latest
 
-      - name: Install Dependencies
-        run: bun install
+  - name: Install dependencies
+    run: bun install
 
-      - name: Install create-dmg
-        run: |
-          brew update
-          brew install create-dmg
+  - name: Install create-dmg
+    run: |
+      brew update
+      brew install create-dmg || true
 
-      - name: Build and package app
-        run: bun run release
+  - name: Install helper tools
+    run: |
+      brew update
+      brew install jq unzip file || true
 
-      - name: Get version from package.json
-        id: get_version
-        run: |
-          if [ -f "package.json" ]; then
-            version=$(jq -r .version package.json)
-            if [ -z "$version" ] || [ "$version" = "null" ]; then
-              echo "Error: version not found in package.json"
-              exit 1
-            fi
-            echo "VERSION=$version" >> $GITHUB_ENV
-            echo "version=$version" >> $GITHUB_OUTPUT
-          else
-            echo "Error: package.json not found"
-            exit 1
-          fi
+  - name: Ensure Neutralino binaries (retry + fallback)
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      set -euo pipefail
 
-      - name: Verify DMG files exist
-        run: |
-          if [ -z "${VERSION}" ]; then
-            echo "Error: VERSION not set"
-            exit 1
-          fi
-          missing=0
-          for arch in x64 universal arm64; do
-            file="dist/AppleBlox-${VERSION}_${arch}.dmg"
-            if [ ! -f "${file}" ]; then
-              echo "Missing: ${file}"
-              missing=1
-            else
-              echo "Found: ${file}"
-            fi
-          done
-          if [ "${missing}" -ne 0 ]; then
-            echo "One or more DMG files are missing"
-            exit 1
-          fi
+      echo "Attempting bunx neu update with retries"
+      max_attempts=3
+      attempt=1
+      success=0
 
-      - name: Upload (mac_x64)
-        uses: actions/upload-artifact@v4
-        with:
-          name: AppleBlox-${{ env.VERSION }}_x64.dmg
-          path: dist/AppleBlox-${{ env.VERSION }}_x64.dmg
-          if-no-files-found: error
-          retention-days: 30
+      while [ $attempt -le $max_attempts ]; do
+        echo "Attempt $attempt/$max_attempts: bunx neu update"
+        if bunx neu update; then
+          echo "bunx neu update succeeded"
+          success=1
+          break
+        else
+          echo "bunx neu update failed (attempt $attempt)"
+        fi
+        attempt=$((attempt+1))
+        sleep $((attempt * 2))
+      done
 
-      - name: Upload (mac_universal)
-        uses: actions/upload-artifact@v4
-        with:
-          name: AppleBlox-${{ env.VERSION }}_universal.dmg
-          path: dist/AppleBlox-${{ env.VERSION }}_universal.dmg
-          if-no-files-found: error
-          retention-days: 30
+      if [ "$success" -eq 1 ]; then
+        echo "Neutralino available, continuing"
+        exit 0
+      fi
 
-      - name: Upload (mac_arm64)
-        uses: actions/upload-artifact@v4
-        with:
-          name: AppleBlox-${{ env.VERSION }}_arm64.dmg
-          path: dist/AppleBlox-${{ env.VERSION }}_arm64.dmg
-          if-no-files-found: error
-          retention-days: 30
+      echo "bunx neu update failed after $max_attempts attempts; falling back to direct download via GitHub API"
 
-      - name: Build Summary
-        if: always()
-        run: |
-          echo "### Build Results" >> $GITHUB_STEP_SUMMARY
-          echo "Version: ${{ env.VERSION }}" >> $GITHUB_STEP_SUMMARY
-          echo "- x64 DMG: $(ls -lh dist/AppleBlox-${VERSION}_x64.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
-          echo "- Universal DMG: $(ls -lh dist/AppleBlox-${VERSION}_universal.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
-          echo "- ARM64 DMG: $(ls -lh dist/AppleBlox-${VERSION}_arm64.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
+      api_url="https://api.github.com/repos/neutralinojs/neutralinojs/releases/latest"
+      echo "Querying releases: $api_url"
+      download_url=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "$api_url" \
+        | jq -r '.assets[] | select(.name | test("binaries.*zip|neutralino.*zip|neutralino.*mac.*zip")) | .browser_download_url' \
+        | head -n1)
 
-  create-release:
-    needs: build
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      if [ -z "$download_url" ] || [ "$download_url" = "null" ]; then
+        echo "Could not determine binaries download URL from releases API"
+        echo "API response preview:"
+        curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "$api_url" | jq -r '.assets[] | .name + " -> " + (.browser_download_url // "no-url")' || true
+        exit 1
+      fi
 
-      - name: Get previous tag
-        run: |
-          echo "PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo '')" >> $GITHUB_ENV
+      echo "Found download URL: $download_url"
+      echo "Downloading into binaries.zip"
+      curl -L -H "Authorization: token ${GITHUB_TOKEN}" -o binaries.zip "$download_url" --fail
+      echo "Download complete. Checking file type..."
+      file_output=$(file --brief --mime-type binaries.zip || true)
+      echo "file identifies as: $file_output"
+      if [[ "$file_output" != "application/zip" ]] && [[ "$file_output" != "application/x-zip" ]] && [[ "$file_output" != "application/octet-stream" ]]; then
+        echo "Downloaded file is not a zip. Dumping first 512 bytes for diagnostic:"
+        head -c 512 binaries.zip | sed -n '1,200p' || true
+        echo "Aborting due to invalid binaries file"
+        exit 1
+      fi
 
-      - name: Generate commit history
-        run: |
-          if [ -n "${PREVIOUS_TAG}" ]; then
-            echo "### Commits since ${PREVIOUS_TAG}" > CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" ${PREVIOUS_TAG}..HEAD >> CHANGELOG.md
-          else
-            echo "### Initial Release" > CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" >> CHANGELOG.md
-          fi
+      echo "Unzipping to neutralino_binaries/"
+      mkdir -p neutralino_binaries
+      unzip -o binaries.zip -d neutralino_binaries
+      echo "Unzip complete. Listing contents:"
+      ls -la neutralino_binaries | sed -n '1,500p'
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
+  - name: Build and package app
+    run: bun run release
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Release ${{ needs.build.outputs.version }}
-          tag_name: ${{ needs.build.outputs.version }}
-          draft: true
-          files: |
-            ./artifacts/AppleBlox-*/*.dmg
-          generate_release_notes: true
-          body_path: CHANGELOG.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - name: Get version from package.json
+    id: get_version
+    run: |
+      if [ -f "package.json" ]; then
+        version=$(jq -r .version package.json)
+        if [ -z "$version" ] || [ "$version" = "null" ]; then
+          echo "Error: version not found in package.json"
+          exit 1
+        fi
+        echo "VERSION=$version" >> $GITHUB_ENV
+        echo "version=$version" >> $GITHUB_OUTPUT
+      else
+        echo "Error: package.json not found"
+        exit 1
+      fi
+
+  - name: Verify DMG files exist
+    run: |
+      if [ -z "${VERSION:-}" ]; then
+        echo "Error: VERSION not set"
+        exit 1
+      fi
+      missing=0
+      for arch in x64 universal arm64; do
+        file="dist/AppleBlox-${VERSION}_${arch}.dmg"
+        if [ ! -f "${file}" ]; then
+          echo "Missing: ${file}"
+          missing=1
+        else
+          echo "Found: ${file}"
+        fi
+      done
+      if [ "${missing}" -ne 0 ]; then
+        echo "One or more DMG files are missing"
+        exit 1
+      fi
+
+  - name: Upload artifact (mac_x64)
+    uses: actions/upload-artifact@v4
+    with:
+      name: AppleBlox-${{ env.VERSION }}_x64.dmg
+      path: dist/AppleBlox-${{ env.VERSION }}_x64.dmg
+      if-no-files-found: error
+      retention-days: 30
+
+  - name: Upload artifact (mac_universal)
+    uses: actions/upload-artifact@v4
+    with:
+      name: AppleBlox-${{ env.VERSION }}_universal.dmg
+      path: dist/AppleBlox-${{ env.VERSION }}_universal.dmg
+      if-no-files-found: error
+      retention-days: 30
+
+  - name: Upload artifact (mac_arm64)
+    uses: actions/upload-artifact@v4
+    with:
+      name: AppleBlox-${{ env.VERSION }}_arm64.dmg
+      path: dist/AppleBlox-${{ env.VERSION }}_arm64.dmg
+      if-no-files-found: error
+      retention-days: 30
+
+  - name: Build summary
+    if: always()
+    run: |
+      echo "### Build Results" >> $GITHUB_STEP_SUMMARY
+      echo "Version: ${{ env.VERSION }}" >> $GITHUB_STEP_SUMMARY
+      echo "- x64 DMG: $(ls -lh dist/AppleBlox-${VERSION}_x64.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
+      echo "- Universal DMG: $(ls -lh dist/AppleBlox-${VERSION}_universal.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
+      echo "- ARM64 DMG: $(ls -lh dist/AppleBlox-${VERSION}_arm64.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
+
+create-release:
+needs: build
+if: github.event_name == ‘push’ && (github.ref == ‘refs/heads/main’ || github.ref == ‘refs/heads/dev’)
+runs-on: ubuntu-latest
+permissions:
+contents: write
+
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+
+  - name: Get previous tag
+    run: |
+      echo "PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo '')" >> $GITHUB_ENV
+
+  - name: Generate commit history
+    run: |
+      if [ -n "${PREVIOUS_TAG}" ]; then
+        echo "### Commits since ${PREVIOUS_TAG}" > CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        git log --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" ${PREVIOUS_TAG}..HEAD >> CHANGELOG.md
+      else
+        echo "### Initial Release" > CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        git log --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" >> CHANGELOG.md
+      fi
+
+  - name: Download all artifacts
+    uses: actions/download-artifact@v4
+    with:
+      path: ./artifacts
+
+  - name: Create release
+    uses: softprops/action-gh-release@v1
+    with:
+      name: Release ${{ needs.build.outputs.version }}
+      tag_name: ${{ needs.build.outputs.version }}
+      draft: true
+      files: |
+        ./artifacts/AppleBlox-*/*.dmg
+      generate_release_notes: true
+      body_path: CHANGELOG.md
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
