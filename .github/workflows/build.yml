@@ -1,6 +1,7 @@
 name: Build and Create DMG
 
 on:
+  workflow_dispatch: {}         # allow manual runs from Actions UI
   push:
     branches:
       - main
@@ -14,7 +15,7 @@ jobs:
   build:
     runs-on: macos-latest
     outputs:
-      version: ${{ env.VERSION }}
+      version: ${{ steps.get_version.outputs.version }}
 
     steps:
       - name: Checkout Repository
@@ -27,23 +28,26 @@ jobs:
 
       - name: Install Dependencies
         run: bun install
-        continue-on-error: false
 
       - name: Install create-dmg
         run: |
           brew update
           brew install create-dmg
-        continue-on-error: false
 
       - name: Build and package app
         run: bun run release
-        continue-on-error: false
 
       - name: Get version from package.json
         id: get_version
         run: |
           if [ -f "package.json" ]; then
-            echo "VERSION=$(jq -r .version package.json)" >> $GITHUB_ENV
+            version=$(jq -r .version package.json)
+            if [ -z "$version" ] || [ "$version" = "null" ]; then
+              echo "Error: version not found in package.json"
+              exit 1
+            fi
+            echo "VERSION=$version" >> $GITHUB_ENV
+            echo "version=$version" >> $GITHUB_OUTPUT
           else
             echo "Error: package.json not found"
             exit 1
@@ -51,12 +55,24 @@ jobs:
 
       - name: Verify DMG files exist
         run: |
+          if [ -z "${VERSION}" ]; then
+            echo "Error: VERSION not set"
+            exit 1
+          fi
+          missing=0
           for arch in x64 universal arm64; do
-            if [ ! -f "dist/AppleBlox-${VERSION}_${arch}.dmg" ]; then
-              echo "Error: DMG file for ${arch} not found"
-              exit 1
+            file="dist/AppleBlox-${VERSION}_${arch}.dmg"
+            if [ ! -f "${file}" ]; then
+              echo "Missing: ${file}"
+              missing=1
+            else
+              echo "Found: ${file}"
             fi
           done
+          if [ "${missing}" -ne 0 ]; then
+            echo "One or more DMG files are missing"
+            exit 1
+          fi
 
       - name: Upload (mac_x64)
         uses: actions/upload-artifact@v4
@@ -85,7 +101,7 @@ jobs:
       - name: Build Summary
         if: always()
         run: |
-          echo "### Build Results 📦" >> $GITHUB_STEP_SUMMARY
+          echo "### Build Results" >> $GITHUB_STEP_SUMMARY
           echo "Version: ${{ env.VERSION }}" >> $GITHUB_STEP_SUMMARY
           echo "- x64 DMG: $(ls -lh dist/AppleBlox-${VERSION}_x64.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
           echo "- Universal DMG: $(ls -lh dist/AppleBlox-${VERSION}_universal.dmg 2>/dev/null || echo 'Not built')" >> $GITHUB_STEP_SUMMARY
@@ -101,7 +117,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # This ensures we fetch all history and tags
+          fetch-depth: 0
 
       - name: Get previous tag
         run: |
@@ -109,10 +125,10 @@ jobs:
 
       - name: Generate commit history
         run: |
-          if [ -n "${{ env.PREVIOUS_TAG }}" ]; then
-            echo "### Commits since ${{ env.PREVIOUS_TAG }}" > CHANGELOG.md
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            echo "### Commits since ${PREVIOUS_TAG}" > CHANGELOG.md
             echo "" >> CHANGELOG.md
-            git log --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" ${{ env.PREVIOUS_TAG }}..HEAD >> CHANGELOG.md
+            git log --pretty=format:"- [%h](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H) %s" ${PREVIOUS_TAG}..HEAD >> CHANGELOG.md
           else
             echo "### Initial Release" > CHANGELOG.md
             echo "" >> CHANGELOG.md
